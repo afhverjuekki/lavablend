@@ -5,6 +5,8 @@ from bpy_extras.io_utils import ImportHelper
 
 import rasterio as rio
 
+from mathutils import Vector
+
 class LavaSimProperties(bpy.types.PropertyGroup):
     LavaSimFolder: bpy.props.StringProperty(
         name="LavaSim Folder",
@@ -31,6 +33,11 @@ class LavaSimProperties(bpy.types.PropertyGroup):
     )
 
     lava_object: bpy.props.PointerProperty(type=bpy.types.Object)
+
+    lava_index: bpy.props.IntProperty(default=0)
+
+    lava_offset_x: bpy.props.FloatProperty(default=0.0)
+    lava_offset_y: bpy.props.FloatProperty(default=0.0)
     
 
 class LavaSim_File(bpy.types.PropertyGroup):
@@ -61,6 +68,10 @@ class LavaSim_Panel(bpy.types.Panel):
         if context.scene.lava_sim_files:
             col.separator(type="LINE")
             col.prop(context.scene.lava_sim_properties, "height_scale")
+            col.prop(context.scene.lava_sim_properties, "lava_index")
+            row = col.row()
+            row.prop(context.scene.lava_sim_properties, "lava_offset_x")
+            row.prop(context.scene.lava_sim_properties, "lava_offset_y")
             col.prop(context.scene.lava_sim_properties, "create_mesh")
             if context.scene.lava_sim_properties.create_mesh:
                 col.operator("lava_sim.render_mesh")
@@ -130,36 +141,52 @@ class LavaSim_Render(bpy.types.Operator):
     bl_options = {"REGISTER", "UNDO"}
 
     def execute(self, context):
-        file = context.scene.lava_sim_files[-1]
+        file = context.scene.lava_sim_files[context.scene.lava_sim_properties.lava_index]
         data = None
         width = 0   
         height = 0
         nodata = None
+        transform = None
+        crs = None
+        
+        # Get the DEM's transform and dimensions
+        dem_transform = None
+        dem_width = 0
+        dem_height = 0
+        dem_data = None
+        dem_nodata = None
+        with rio.open(context.scene.demm_properties.Filepath) as src:
+            dem_transform = src.transform
+            dem_width = src.width
+            dem_height = src.height
+            dem_data = src.read(1)
+            dem_nodata = src.nodata
+        
         with rio.open(file.path) as src:
             data = src.read(1)
             width = src.width
             height = src.height
             nodata = src.nodata
+            transform = src.transform
+            crs = src.crs
         
         if context.scene.lava_sim_properties.create_mesh:
-            vertices, faces = self.create_mesh(data, width, height, nodata)
+            vertices, faces = self.create_mesh(data, width, height, nodata, transform, dem_transform, dem_width, dem_height, dem_data, dem_nodata)
 
             mesh = bpy.data.meshes.new(name="LavaSim Volume")
             mesh.from_pydata(vertices, [], faces)
             mesh.update()
 
-            position = (0, 0, 0)
-
             if context.scene.lava_sim_properties.lava_object:
-                position = context.scene.lava_sim_properties.lava_object.location
                 bpy.data.objects.remove(context.scene.lava_sim_properties.lava_object, do_unlink=True)
 
             obj = bpy.data.objects.new(name="LavaSim Volume", object_data=mesh)
-            obj.location = position
             context.collection.objects.link(obj)
             context.scene.lava_sim_properties.lava_object = obj
+            obj.select_set(True)
+            bpy.ops.object.origin_set(type='ORIGIN_CENTER_OF_MASS')
         else:
-            vertices = self.create_vertices(data, width, height, nodata)
+            vertices = self.create_vertices(data, width, height, nodata, transform, dem_transform, dem_width, dem_height, dem_data, dem_nodata)
 
             mesh = bpy.data.meshes.new(name="LavaSim Volume")
             mesh.from_pydata(vertices, [], [])
@@ -173,17 +200,39 @@ class LavaSim_Render(bpy.types.Operator):
 
         return {'FINISHED'}
     
-    def create_vertices(self, data, width, height, nodata):
+    def get_dem_height(self, x, y, dem_data, dem_transform, dem_width, dem_height, dem_nodata):
+        #return dem_data[int(y), int(x)]+88.4382
+        start = Vector((x, y, 1000))
+        direction = Vector((x, y, 0)) - start
+        direction.normalize()
+        hit, loc, norm, idx, obj, mw = bpy.context.scene.ray_cast(bpy.context.view_layer.depsgraph, start, direction)
+        if hit:
+            return loc.z
+        else:
+            return None
+
+    def create_vertices(self, data, width, height, nodata, transform=None, dem_transform=None, dem_width=0, dem_height=0, dem_data=None, dem_nodata=None):
         vertices = []
 
         for y in range(height):
             for x in range(width):
                 if data[y, x] != nodata:
-                    vertices.append((x, y, data[y, x] * bpy.context.scene.lava_sim_properties.height_scale))
+                    if transform and dem_transform:
+                        # Convert pixel coordinates to geographic coordinates
+                        lon, lat = transform * (x, y)
+                        # Convert geographic coordinates to DEM's coordinate system
+                        dem_x, dem_y = ~dem_transform * (lon, lat)
+                        # Get DEM height at this location
+                        dem_height = self.get_dem_height(lon, lat, dem_data, dem_transform, dem_width, dem_height, dem_nodata)
+                        # Add DEM height to lava thickness
+                        total_height = dem_height + (data[y, x] * bpy.context.scene.lava_sim_properties.height_scale)
+                        vertices.append((dem_x, dem_y, total_height))
+                    else:
+                        vertices.append((x, y, data[y, x] * bpy.context.scene.lava_sim_properties.height_scale))
 
         return vertices
 
-    def create_mesh(self, data, width, height, nodata):
+    def create_mesh(self, data, width, height, nodata, transform=None, dem_transform=None, dem_width=0, dem_height=0, dem_data=None, dem_nodata=None):
         vertices = []
         faces = []
         vert_indices = {}
@@ -192,7 +241,17 @@ class LavaSim_Render(bpy.types.Operator):
             for x in range(width):
                 if data[y, x] != nodata:
                     vert_idx = len(vertices)
-                    vertices.append((x, y, data[y, x] * bpy.context.scene.lava_sim_properties.height_scale))
+                    if transform and dem_transform:
+                        lon, lat = transform * (x, y)
+                        dem_x, dem_y = ~dem_transform * (lon, lat)
+
+                        # Get DEM height at this location
+                        dem_height = self.get_dem_height(dem_x + bpy.context.scene.lava_sim_properties.lava_offset_x, dem_y + bpy.context.scene.lava_sim_properties.lava_offset_y, dem_data, dem_transform, dem_width, dem_height, dem_nodata)
+                        # Add DEM height to lava thickness
+                        total_height = dem_height + ((data[y, x] * bpy.context.scene.lava_sim_properties.height_scale))
+                        vertices.append((dem_x, dem_y, total_height))
+                    else:
+                        vertices.append((x + bpy.context.scene.lava_sim_properties.lava_offset_x, y + bpy.context.scene.lava_sim_properties.lava_offset_y, data[y, x] * bpy.context.scene.lava_sim_properties.height_scale))
                     vert_indices[(x, y)] = vert_idx
 
         for y in range(height - 1):
