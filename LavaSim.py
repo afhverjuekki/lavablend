@@ -7,6 +7,10 @@ import rasterio as rio
 
 from mathutils import Vector
 
+class LavaSim_Frame(bpy.types.PropertyGroup):
+    index: bpy.props.IntProperty(default=0)
+    object: bpy.props.PointerProperty(type=bpy.types.Object)
+
 class LavaSimProperties(bpy.types.PropertyGroup):
     LavaSimFolder: bpy.props.StringProperty(
         name="LavaSim Folder",
@@ -38,6 +42,8 @@ class LavaSimProperties(bpy.types.PropertyGroup):
 
     lava_offset_x: bpy.props.FloatProperty(default=0.0)
     lava_offset_y: bpy.props.FloatProperty(default=0.0)
+
+    frame_spacing: bpy.props.FloatProperty(default=1.0)
     
 
 class LavaSim_File(bpy.types.PropertyGroup):
@@ -69,6 +75,7 @@ class LavaSim_Panel(bpy.types.Panel):
             col.separator(type="LINE")
             col.prop(context.scene.lava_sim_properties, "height_scale")
             col.prop(context.scene.lava_sim_properties, "lava_index")
+            col.prop(context.scene.lava_sim_properties, "frame_spacing")
             row = col.row()
             row.prop(context.scene.lava_sim_properties, "lava_offset_x")
             row.prop(context.scene.lava_sim_properties, "lava_offset_y")
@@ -132,6 +139,7 @@ class LavaSim_RenderMesh(bpy.types.Operator):
     bl_options = {"REGISTER", "UNDO"}
 
     def execute(self, context):
+        bpy.types.Scene.lava_sim_frames = bpy.props.CollectionProperty(type=LavaSim_Frame)
         bpy.ops.lava_sim.render()
         return {'FINISHED'}
 
@@ -141,7 +149,18 @@ class LavaSim_Render(bpy.types.Operator):
     bl_options = {"REGISTER", "UNDO"}
 
     def execute(self, context):
-        file = context.scene.lava_sim_files[context.scene.lava_sim_properties.lava_index]
+        collection = bpy.data.collections.new(name="LavaSim Frames")
+        bpy.context.collection.children.link(collection)
+        for i in range(len(bpy.context.scene.lava_sim_files)):
+            self.render_frame(context, i, collection)
+            print(f"Rendered frame {i}")
+        return {'FINISHED'}
+
+    def render_frame(self, context, framepath, collection):
+        frame = bpy.context.scene.lava_sim_frames.add()
+        frame.index = len(bpy.context.scene.lava_sim_frames)
+
+        file = context.scene.lava_sim_files[framepath]
         data = None
         width = 0   
         height = 0
@@ -177,14 +196,43 @@ class LavaSim_Render(bpy.types.Operator):
             mesh.from_pydata(vertices, [], faces)
             mesh.update()
 
-            if context.scene.lava_sim_properties.lava_object:
-                bpy.data.objects.remove(context.scene.lava_sim_properties.lava_object, do_unlink=True)
+            #if context.scene.lava_sim_properties.lava_object:
+             #   bpy.data.objects.remove(context.scene.lava_sim_properties.lava_object, do_unlink=True)
 
             obj = bpy.data.objects.new(name="LavaSim Volume", object_data=mesh)
-            context.collection.objects.link(obj)
+            collection.objects.link(obj)
             context.scene.lava_sim_properties.lava_object = obj
-            obj.select_set(True)
-            bpy.ops.object.origin_set(type='ORIGIN_CENTER_OF_MASS')
+
+            """
+            obj.animation_data_create()
+            ac = bpy.data.actions.new(name="LavaSim Volume")
+            obj.animation_data.action = ac
+            fc = ac.fcurves.new(data_path="hide_viewport")
+            fc.keyframe_points.add(4)
+
+            fc.keyframe_points.foreach_set("co", [0, True, 1,False,framepath,True,framepath+1,False])"""
+            
+            obj.hide_viewport = True
+            obj.hide_render = True
+            obj.keyframe_insert(data_path="hide_viewport", frame=1)
+            obj.keyframe_insert(data_path="hide_render", frame=1)
+
+            obj.hide_viewport = True
+            obj.hide_render = True
+            obj.keyframe_insert(data_path="hide_viewport", frame=framepath*context.scene.lava_sim_properties.frame_spacing-1)
+            obj.keyframe_insert(data_path="hide_render", frame=framepath*context.scene.lava_sim_properties.frame_spacing-1)
+
+            obj.hide_viewport = False
+            obj.hide_render = False
+            obj.keyframe_insert(data_path="hide_viewport", frame=framepath*context.scene.lava_sim_properties.frame_spacing)
+            obj.keyframe_insert(data_path="hide_render", frame=framepath*context.scene.lava_sim_properties.frame_spacing)
+
+            
+            obj.hide_viewport = True
+            obj.hide_render = True
+            obj.keyframe_insert(data_path="hide_viewport", frame=(framepath*context.scene.lava_sim_properties.frame_spacing)+context.scene.lava_sim_properties.frame_spacing)
+            obj.keyframe_insert(data_path="hide_render", frame=(framepath*context.scene.lava_sim_properties.frame_spacing)+context.scene.lava_sim_properties.frame_spacing)
+            #obj.select_set(True)
         else:
             vertices = self.create_vertices(data, width, height, nodata, transform, dem_transform, dem_width, dem_height, dem_data, dem_nodata)
 
@@ -193,11 +241,13 @@ class LavaSim_Render(bpy.types.Operator):
             mesh.update()
 
             obj = bpy.data.objects.new(name="LavaSim Volume", object_data=mesh)
-            context.collection.objects.link(obj)
+            collection.objects.link(obj)
             context.scene.lava_sim_properties.lava_object = obj
         
-        self.set_view(context, width)
+        frame.object = obj
+        #obj.hide_set(True)
 
+        #self.set_view(context, width)
         return {'FINISHED'}
     
     def get_dem_height(self, x, y, dem_data, dem_transform, dem_width, dem_height, dem_nodata):
@@ -220,15 +270,18 @@ class LavaSim_Render(bpy.types.Operator):
                     if transform and dem_transform:
                         # Convert pixel coordinates to geographic coordinates
                         lon, lat = transform * (x, y)
-                        # Convert geographic coordinates to DEM's coordinate system
                         dem_x, dem_y = ~dem_transform * (lon, lat)
-                        # Get DEM height at this location
-                        dem_height = self.get_dem_height(lon, lat, dem_data, dem_transform, dem_width, dem_height, dem_nodata)
+                        # Get DEM height at this location with offset
+                        dem_height = self.get_dem_height(dem_x + bpy.context.scene.lava_sim_properties.lava_offset_x, 
+                                                       dem_y + bpy.context.scene.lava_sim_properties.lava_offset_y, 
+                                                       dem_data, dem_transform, dem_width, dem_height, dem_nodata)
                         # Add DEM height to lava thickness
                         total_height = dem_height + (data[y, x] * bpy.context.scene.lava_sim_properties.height_scale)
                         vertices.append((dem_x, dem_y, total_height))
                     else:
-                        vertices.append((x, y, data[y, x] * bpy.context.scene.lava_sim_properties.height_scale))
+                        vertices.append((x + bpy.context.scene.lava_sim_properties.lava_offset_x, 
+                                       y + bpy.context.scene.lava_sim_properties.lava_offset_y, 
+                                       data[y, x] * bpy.context.scene.lava_sim_properties.height_scale))
 
         return vertices
 
@@ -295,7 +348,8 @@ classes = [
     LavaSim_ImportFiles,
     LavaSim_RenderVolume,
     LavaSim_RenderMesh,
-    LavaSim_Render
+    LavaSim_Render,
+    LavaSim_Frame
 ]
 
 def register():
