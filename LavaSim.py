@@ -4,6 +4,7 @@ from bpy.props import StringProperty, CollectionProperty, BoolProperty
 from bpy_extras.io_utils import ImportHelper
 
 import rasterio as rio
+import re  # Add import for regular expressions
 
 from mathutils import Vector
 
@@ -107,21 +108,91 @@ class LavaSim_ImportFiles(bpy.types.Operator):
     bl_options = {"REGISTER", "UNDO"}
 
     def execute(self, context):
-        dir = os.listdir(context.scene.lava_sim_properties.LavaSimFolder)
-        files = []
-        for file in dir:
-            if file.endswith(".tif"):
-                file_name = os.path.splitext(file)[0]
-                file_index = file_name.split(context.scene.lava_sim_properties.file_index_delimiter)[-1]
-                files.append({"index": file_index, "name": file_name, "path": os.path.join(context.scene.lava_sim_properties.LavaSimFolder, file)})
+        props = context.scene.lava_sim_properties
+        folder_path = props.LavaSimFolder
+        delimiter = props.file_index_delimiter
         
-        files.sort(key=lambda x: int(x["index"]))
-        for file in files:
+        context.scene.lava_sim_files.clear() # Clear previous list
+
+        try:
+            dir_contents = os.listdir(folder_path)
+        except FileNotFoundError:
+            self.report({'ERROR'}, f"Folder not found: {folder_path}")
+            return {'CANCELLED'}
+            
+        tif_files = [f for f in dir_contents if f.lower().endswith(".tif")]
+        
+        if not tif_files:
+            self.report({'WARNING'}, f"No .tif files found in {folder_path}")
+            return {'FINISHED'}
+
+        files_data = []
+        skipped_files = 0
+        detected_format = None
+
+        # Try to detect format based on the first file
+        first_filename = os.path.splitext(tif_files[0])[0]
+        lava2d_match = re.search(r"T\+(\d+)\.(\d+)hr", first_filename, re.IGNORECASE)
+        
+        if lava2d_match:
+            detected_format = "Lava2D"
+            print("Detected Lava2D file format.")
+        else:
+            detected_format = "Molasses"
+            print(f"Assuming Molasses file format (using delimiter '{delimiter}').")
+
+        for file in tif_files:
+            file_name = os.path.splitext(file)[0]
+            file_path = os.path.join(folder_path, file)
+            sort_key = None
+
+            try:
+                if detected_format == "Lava2D":
+                    match = re.search(r"T\+(\d+)\.(\d+)hr", file_name, re.IGNORECASE)
+                    if match:
+                        hours = int(match.group(1))
+                        decimal_hours = int(match.group(2))
+                        # Assuming the decimal part represents tenths of an hour
+                        sort_key = hours + (decimal_hours / 10.0) 
+                    else:
+                         raise ValueError("Filename does not match Lava2D pattern")
+                
+                elif detected_format == "Molasses":
+                    parts = file_name.split(delimiter)
+                    if len(parts) > 1:
+                        sort_key = int(parts[-1])
+                    else:
+                        raise ValueError(f"Filename does not contain delimiter '{delimiter}'")
+
+                if sort_key is not None:
+                    files_data.append({"sort_key": sort_key, "name": file_name, "path": file_path})
+                else:
+                     raise ValueError("Could not determine sort key")
+
+            except (ValueError, IndexError) as e:
+                print(f"Warning: Skipping file '{file}'. Reason: {e}")
+                skipped_files += 1
+
+        if not files_data:
+             self.report({'WARNING'}, f"No compatible files found or parsed in {folder_path}")
+             return {'FINISHED'}
+
+        # Sort files based on the extracted key
+        files_data.sort(key=lambda x: x["sort_key"])
+
+        # Populate the collection property
+        for i, file_info in enumerate(files_data):
             prop = context.scene.lava_sim_files.add()
-            prop.index = int(file["index"])
-            prop.name = file["name"]
-            prop.path = file["path"]
-        print("LavaSim Files imported");
+            # Use the sort key or simple index? Using index for now.
+            prop.index = i 
+            prop.name = file_info["name"]
+            prop.path = file_info["path"]
+        
+        report_message = f"Imported {len(files_data)} files ({detected_format} format)."
+        if skipped_files > 0:
+             report_message += f" Skipped {skipped_files} files."
+        self.report({'INFO'}, report_message)
+        print(report_message)
         return {'FINISHED'}
 
 class LavaSim_RenderVolume(bpy.types.Operator):
