@@ -40,6 +40,12 @@ See below if you don't have Blender available in your CLI.
 sudo ln -s /Applications/Blender.app/Contents/MacOS/Blender /usr/local/bin/blender
 ```
 
+You may experience Python environment clashes, this also works;
+
+```bash
+/Applications/Blender.app/Contents/MacOS/Blender --command extension build --split-platform
+```
+
 ### Linux
 If you installed Blender via package manager, the CLI should already be available.
 
